@@ -4,3 +4,4 @@ sqlalchemy
 aiosqlite
 openai
 python-dotenv
+litellm
