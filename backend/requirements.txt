@@ -4,3 +4,5 @@ sqlalchemy
 aiosqlite
 openai
 python-dotenv
+litellm
+greenlet>=3.0.0

@@ -12,6 +12,7 @@ from sqlalchemy.future import select
 from dotenv import load_dotenv
 import litellm
 from pydantic import BaseModel
+from typing import Optional
 
 from database import engine, Base, SessionLocal, get_db
 from models import Setting, ExecutionLog
@@ -33,12 +34,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-async def get_api_key(db: AsyncSession, key_name: str, env_fallback: str) -> str:
+async def get_api_key(db: AsyncSession, key_name: str, env_fallback: str = "") -> str:
     result = await db.execute(select(Setting).where(Setting.key == key_name))
     setting = result.scalar_one_or_none()
     if setting and setting.value:
         return setting.value
-    return os.getenv(env_fallback)
+    return os.getenv(env_fallback) if env_fallback else None
+
+async def upsert_setting(db: AsyncSession, key: str, value: str):
+    """Insert or update a single Setting row (commit is the caller's job)."""
+    result = await db.execute(select(Setting).where(Setting.key == key))
+    setting = result.scalar_one_or_none()
+    if setting:
+        setting.value = value
+    else:
+        db.add(Setting(key=key, value=value))
+
+# Maps the per-provider slot used by the frontend/execute path to the DB key
+# used by /api/settings/keys.
+PROVIDER_SETTING_KEYS = {
+    "openai": "openai_api_key",
+    "anthropic": "anthropic_api_key",
+    "gemini": "gemini_api_key",
+    "glm": "zhipuai_api_key",
+}
+
+async def fill_missing_keys_from_db(db: AsyncSession, api_keys: dict):
+    """Fill any provider key not supplied via headers from stored settings,
+    so keys saved through /api/settings/keys are actually usable by jobs."""
+    for provider_slot, setting_key in PROVIDER_SETTING_KEYS.items():
+        if not api_keys.get(provider_slot):
+            api_keys[provider_slot] = await get_api_key(db, setting_key)
 
 def get_api_key_for_model(model_id: str, api_keys: dict):
     if model_id.startswith("gpt"):
@@ -95,7 +121,11 @@ async def process_ads_job(task_id: str, product_url: str, description: str, budg
             log = result.scalar_one()
             log.status = "running"
             await db.commit()
-            
+
+            # Header keys win; fall back to keys stored via /api/settings/keys,
+            # then to env vars (handled inside get_api_key_for_model).
+            await fill_missing_keys_from_db(db, api_keys)
+
             api_key = get_api_key_for_model(provider, api_keys)
             api_base = "http://localhost:11434" if provider.startswith("ollama") else None
             
@@ -213,19 +243,22 @@ async def get_task_status(task_id: str, db: AsyncSession = Depends(get_db)):
     }
 
 class ApiKeysUpdate(BaseModel):
-    openai_api_key: str
+    openai_api_key: Optional[str] = None
+    anthropic_api_key: Optional[str] = None
+    gemini_api_key: Optional[str] = None
+    zhipuai_api_key: Optional[str] = None
 
 @app.post("/api/settings/keys")
 async def update_keys(req: ApiKeysUpdate, db: AsyncSession = Depends(get_db)):
-    if req.openai_api_key:
-        res = await db.execute(select(Setting).where(Setting.key == "openai_api_key"))
-        setting = res.scalar_one_or_none()
-        if setting:
-            setting.value = req.openai_api_key
-        else:
-            db.add(Setting(key="openai_api_key", value=req.openai_api_key))
+    stored = 0
+    for field in ("openai_api_key", "anthropic_api_key", "gemini_api_key", "zhipuai_api_key"):
+        value = getattr(req, field, None)
+        if value:
+            await upsert_setting(db, field, value)
+            stored += 1
+    if stored:
         await db.commit()
-    return {"status": "success"}
+    return {"status": "success", "stored": stored}
 
 if __name__ == "__main__":
     import uvicorn
