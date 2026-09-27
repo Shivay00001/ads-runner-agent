@@ -56,14 +56,82 @@ async def _override_get_db():
 @pytest.fixture(scope="module")
 def client():
     asyncio.run(_init_db())
+    os.environ["API_KEY"] = "test-shared-secret"
     server.app.dependency_overrides[database.get_db] = _override_get_db
     # The background job uses server.SessionLocal directly; point it at the test DB.
     server.SessionLocal = TestSessionLocal
+    # Lifespan creates tables via server.engine; keep that on the test DB too so
+    # the repo's dev database file is never touched by tests.
+    server.engine = test_engine
     with TestClient(server.app) as c:
         yield c
     server.app.dependency_overrides.clear()
     if os.path.exists(TEST_DB_PATH):
         os.remove(TEST_DB_PATH)
+
+
+AUTH_HEADERS = {"X-API-Key": "test-shared-secret"}
+
+
+def test_health_is_public():
+    """Production bar: /health returns 200 with no auth."""
+    import httpx
+
+    # Build a throwaway client without the auth fixture's dependency overrides.
+    os.environ["API_KEY"] = "test-shared-secret"
+    server.app.dependency_overrides[database.get_db] = _override_get_db
+    with TestClient(server.app, raise_server_exceptions=False) as c:
+        r = c.get("/health")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "ok"
+        assert body["service"] == "ads-runner-agent"
+    server.app.dependency_overrides.clear()
+
+
+def test_api_requires_api_key(client):
+    """/api/* endpoints must 401 without the X-API-Key header."""
+    payload = {
+        "product_url": "https://example.com/widget",
+        "description": "A test widget with enough words",
+        "budget": "50.00",
+        "provider": "gpt-4o",
+    }
+    r = client.post("/api/execute", json=payload)
+    assert r.status_code == 401
+    assert "traceback" not in r.text.lower()
+    r = client.get("/api/tasks/some-id")
+    assert r.status_code == 401
+    r = client.post("/api/settings/keys", json={"openai_api_key": "dummy-key-abc"})
+    assert r.status_code == 401
+
+
+def test_execute_rejects_invalid_input(client):
+    """External inputs are validated: bad URL / short description / unknown
+    provider must 422 with structured JSON and no stack trace."""
+    r = client.post(
+        "/api/execute",
+        json={"product_url": "not-a-url", "description": "short", "budget": "",
+              "provider": "mystery-9000"},
+        headers=AUTH_HEADERS,
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "validation_error"
+    assert "traceback" not in r.text.lower()
+
+
+def test_cors_not_wide_open(client):
+    """Credentialed endpoints must not serve Access-Control-Allow-Origin: *."""
+    r = client.options(
+        "/api/execute",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    allow_origin = r.headers.get("access-control-allow-origin")
+    assert allow_origin != "*", f"CORS is wide open: {allow_origin}"
 
 
 def test_requirements_includes_litellm():
@@ -82,7 +150,7 @@ def test_settings_keys_persist_all_providers(client):
         "gemini_api_key": "dummy-gemini-123",
         "zhipuai_api_key": "dummy-zhipu-123",
     }
-    r = client.post("/api/settings/keys", json=payload)
+    r = client.post("/api/settings/keys", json=payload, headers=AUTH_HEADERS)
     assert r.status_code == 200
     assert r.json()["status"] == "success"
 
@@ -107,7 +175,7 @@ def _poll_until_terminal(client, task_id, timeout_s=90):
     deadline = time.time() + timeout_s
     first_seen = None
     while time.time() < deadline:
-        r = client.get(f"/api/tasks/{task_id}")
+        r = client.get(f"/api/tasks/{task_id}", headers=AUTH_HEADERS)
         assert r.status_code == 200
         body = r.json()
         status = body["status"]
@@ -130,7 +198,7 @@ def test_task_lifecycle_real_provider_auth_error(client):
             "budget": "50.00",
             "provider": "gpt-4o",
         },
-        headers={"X-OpenAI-Key": "dummy-header-key-abc"},
+        headers={"X-API-Key": "test-shared-secret", "X-OpenAI-Key": "dummy-header-key-abc"},
     )
     assert r.status_code == 200
     task_id = r.json()["task_id"]
@@ -150,7 +218,8 @@ def test_stored_keys_are_used_by_jobs(client):
     """Keys saved via /api/settings/keys must actually be used when the job
     runs (no headers, no env key). The authentic error echo proves it."""
     r = client.post(
-        "/api/settings/keys", json={"openai_api_key": "dummy-stored-key-xyz"}
+        "/api/settings/keys", json={"openai_api_key": "dummy-stored-key-xyz"},
+        headers=AUTH_HEADERS
     )
     assert r.status_code == 200
 
@@ -162,6 +231,7 @@ def test_stored_keys_are_used_by_jobs(client):
             "budget": "20.00",
             "provider": "gpt-4o",
         },
+        headers=AUTH_HEADERS,
     )
     assert r.status_code == 200
     task_id = r.json()["task_id"]
@@ -176,6 +246,6 @@ def test_stored_keys_are_used_by_jobs(client):
 
 
 def test_unknown_task_returns_404(client):
-    r = client.get("/api/tasks/does-not-exist")
+    r = client.get("/api/tasks/does-not-exist", headers=AUTH_HEADERS)
     assert r.status_code == 404
-    assert r.json()["detail"] == "Task not found"
+    assert r.json()["message"] == "Task not found"

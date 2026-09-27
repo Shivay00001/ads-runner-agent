@@ -2,9 +2,15 @@
 
 import { useState, useEffect } from 'react';
 
+// Backend base URL comes from NEXT_PUBLIC_API_BASE_URL (set in .env.local or the
+// hosting provider). Falls back to the local dev backend.
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:8007';
+
 export default function Home() {
   const [provider, setProvider] = useState('gpt-4o');
   const [keys, setKeys] = useState({ openai: '', anthropic: '', gemini: '', glm: '' });
+  // Shared-secret API key for the backend (X-API-Key header). Stored locally only.
+  const [apiKey, setApiKey] = useState('');
   
   const [productUrl, setProductUrl] = useState('');
   const [description, setDescription] = useState('');
@@ -23,12 +29,15 @@ export default function Home() {
       gemini: localStorage.getItem('ads_gemini_key') || '',
       glm: localStorage.getItem('ads_glm_key') || ''
     });
+    setApiKey(localStorage.getItem('ads_api_key') || '');
 
     let interval: NodeJS.Timeout;
     if (taskId && (status === 'pending' || status === 'running')) {
       interval = setInterval(async () => {
         try {
-          const res = await fetch(`http://localhost:8007/api/tasks/${taskId}`);
+          const res = await fetch(`${API_BASE}/api/tasks/${taskId}`, {
+            headers: { 'X-API-Key': apiKey }
+          });
           if (res.ok) {
             const data = await res.json();
             setStatus(data.status);
@@ -46,7 +55,7 @@ export default function Home() {
       }, 3000);
     }
     return () => clearInterval(interval);
-  }, [taskId, status]);
+  }, [taskId, status, apiKey]);
 
   const handleExecute = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -62,11 +71,13 @@ export default function Home() {
       localStorage.setItem('ads_anthropic_key', keys.anthropic);
       localStorage.setItem('ads_gemini_key', keys.gemini);
       localStorage.setItem('ads_glm_key', keys.glm);
+      localStorage.setItem('ads_api_key', apiKey);
 
-      const res = await fetch('http://localhost:8007/api/execute', {
+      const res = await fetch(`${API_BASE}/api/execute`, {
         method: 'POST',
-        headers: { 
+        headers: {
           'Content-Type': 'application/json',
+          'X-API-Key': apiKey,
           'X-OpenAI-Key': keys.openai,
           'X-Anthropic-Key': keys.anthropic,
           'X-Gemini-Key': keys.gemini,
@@ -117,6 +128,10 @@ export default function Home() {
         <div style={{flex: 1}}>
           <div className="panel">
             <h2 className="panel-title">System Configuration</h2>
+            <div className="form-group">
+              <label>Backend API Key (X-API-Key)</label>
+              <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="Matches API_KEY in backend/.env" disabled={status === 'pending' || status === 'running'} />
+            </div>
             <div className="form-group">
               <label>OpenAI (GPT-4o)</label>
               <input type="password" value={keys.openai} onChange={(e) => setKeys({...keys, openai: e.target.value})} disabled={status === 'pending' || status === 'running'} />

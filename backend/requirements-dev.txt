@@ -1,0 +1,4 @@
+# Dev/test-only dependencies (not needed to run the server).
+-r requirements.txt
+pytest
+httpx
